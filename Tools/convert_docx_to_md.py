@@ -123,6 +123,16 @@ def _runs_to_tokens(paragraph, part, images_dir: Path, exported: set) -> list:
                     })
             else:
                 raw_runs.append(data)
+    
+    # Fallback: 如果 runs 为空但段落有文本（可能在域代码或超链接中），直接使用 paragraph.text
+    if not raw_runs and paragraph.text.strip():
+        raw_runs.append({
+            'text': paragraph.text,
+            'bold': False,
+            'italic': False,
+            'is_image': False,
+            'is_line_break': False,
+        })
 
     # 合并连续样式一致（且非图片/换行） 的 run，减少重复 ** 包裹
     merged = []
@@ -245,6 +255,35 @@ def extract(docx_path: str, normalize: bool = False) -> Path:
             continue
 
         style_name = paragraph.style.name if paragraph.style else ''
+        
+        # 处理目录样式（toc 1, toc 2, toc 3 等）
+        if style_name.lower().startswith('toc '):
+            # 提取目录级别
+            try:
+                level_str = style_name.split(' ')[1]
+                level = int(level_str)
+            except (IndexError, ValueError):
+                level = 1
+            
+            # 获取文本并移除页码（制表符后的数字）
+            text = ''.join(tokens)
+            # 分离标题和页码
+            if '\t' in text:
+                parts = text.split('\t')
+                title = parts[0].strip()
+                page_num = parts[-1].strip() if len(parts) > 1 else ''
+            else:
+                title = text.strip()
+                page_num = ''
+            
+            # 根据级别添加缩进
+            indent = '  ' * (level - 1)
+            if page_num:
+                md_lines.append(f"{indent}- {title} ... {page_num}")
+            else:
+                md_lines.append(f"{indent}- {title}")
+            continue
+        
         # 标题映射
         if style_name.startswith('Heading '):
             try:
