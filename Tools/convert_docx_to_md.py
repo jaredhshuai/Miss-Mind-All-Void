@@ -322,6 +322,42 @@ def extract(docx_path: str, normalize: bool = False) -> Path:
         line = re.sub(r'\*\*(“.*?”)([，。！？；：,.!;:?])\*\*', r'**\1**\2', line)
         return line
     md_lines = [_fix_chinese_bold(l) for l in md_lines]
+
+    # --- Post processing for markdown rendering compatibility ---
+    def _post_process(lines: list[str]) -> list[str]:
+        processed = []
+        for line in lines:
+            # Replace non-breaking spaces with normal spaces
+            if '\u00A0' in line:
+                line = line.replace('\u00A0', ' ')
+
+            # Split a leading full bold sentence from following text into its own paragraph
+            # Pattern: **....**<non-space or space then other text>
+            m = re.match(r'^\*\*[^*]+?\*\*')
+            if m and m.end() < len(line.strip()):
+                # Ensure we are not splitting headings or list markers (line already starts with ** so fine)
+                bold_part = line[:m.end()].rstrip()
+                rest = line[m.end():].lstrip()
+                processed.append(bold_part)
+                if rest:
+                    processed.append(rest)
+                continue
+
+            processed.append(line)
+        # Add trailing two spaces to every non-empty line (soft line breaks inside paragraphs)
+        normalized = []
+        for ln in processed:
+            if ln and not ln.endswith('  '):
+                # Avoid adding spaces to table separator lines like | --- |
+                if ln.startswith('|') and ln.endswith('|'):
+                    normalized.append(ln)
+                else:
+                    normalized.append(ln + '  ')
+            else:
+                normalized.append(ln)
+        return normalized
+
+    md_lines = _post_process(md_lines)
     md_content = "\n".join(md_lines) + "\n"
     md_path = p.parent / f"{base_name}.md"
     md_path.write_text(md_content, encoding='utf-8')
