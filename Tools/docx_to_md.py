@@ -131,24 +131,29 @@ def fix_bold_quotes(text: str) -> str:
     """
     # 第一步：统一所有引号编码为标准中文引号
     text = normalize_punctuation(text)
-    
-    # 第二步：进行格式转换（现在只需要处理统一后的中文引号）
-    
+
+    # 处理中文引号“”在粗体内的情况，移到外部：**“内容”** -> “**内容**”
+    # 1. **“内容”** -> “**内容**”
+    text = re.sub(r'\*\*“([^”]+)”\*\*', r'“**\1**”', text)
+    # 2. **“内容**” -> “**内容**”
+    text = re.sub(r'\*\*“([^*]+)\*\*”', r'“**\1**”', text)
+    # 3. **内容”** -> **内容**”
+    text = re.sub(r'\*\*([^”]+)”\*\*', r'**\1**”', text)
+    # 4. **“内容** -> “**内容**
+    text = re.sub(r'\*\*“([^*]+)\*\*', r'“**\1**', text)
+    # 5. **内容”** -> **内容**”
+    text = re.sub(r'\*\*([^”]+)”\*\*', r'**\1**”', text)
+
+    # 兼容英文引号的原有逻辑
     # 规则0：**"xxx"yyy** -> **"xxx"**yyy（处理引号在粗体开头的情况）
     text = re.sub(r'\*\*"([^"]*?)"([^*]*?)\*\*', r'**"\1"**\2', text)
-    
     # 规则1："**文本**" -> **"文本"**
-    # 匹配：开引号 + 粗体 + 结束引号
     text = re.sub(r'"(\*\*([^*]+?)\*\*)"', lambda m: f'**"{m.group(2)}"**', text)
-    
     # 规则2："**文本**。" -> **"文本。"**
-    # 匹配：开引号 + 粗体 + 标点 + 结束引号
     text = re.sub(r'"(\*\*([^*]+?)\*\*)([。，、！？；：])"', lambda m: f'**"{m.group(2)}{m.group(3)}"**', text)
-    
     # 规则3：**"xxx**" -> **"xxx"**
-    # 处理粗体开始正确但结束位置错误的情况
     text = re.sub(r'\*\*"([^"]+?)\*\*"', r'**"\1"**', text)
-    
+
     return text
 
 
@@ -404,8 +409,13 @@ def _fix_chinese_bold(line: str) -> str:
         return '**' + ''.join(inner_parts) + '**'
     line = re.sub(r'(?:\*\*[^*]+?\*\*){2,}', _merge, line)
     
-    # 将标点符号移到粗体外面
+    # 将所有标点符号移到粗体外面（包括引号）
+    # 处理粗体内部结尾的引号 + 标点：**"xxx"，** -> **"xxx"**，
     line = re.sub(r'\*\*(".*?")([，。！？；：,.!;:?])\*\*', r'**\1**\2', line)
+    # 处理粗体内部结尾的标点（不含引号）：**xxx，** -> **xxx**，
+    line = re.sub(r'\*\*([^*"]+?)([，。！？；：,.!;:?])\*\*', r'**\1**\2', line)
+    # 处理粗体内部开头的引号：**"xxx** -> "**xxx**
+    line = re.sub(r'\*\*(")', r'\1**', line)
     
     return line
 
@@ -452,10 +462,13 @@ def _post_process(lines: list[str]) -> list[str]:
             line = fix_bold_quotes(line)
             line = _merge_adjacent_bold(line)
             
-            # 将标点符号移到粗体外面
+            # 将所有标点符号移到粗体外面（包括引号）
+            # 处理粗体内部结尾的引号 + 标点：**"xxx"，** -> **"xxx"**，
             line = re.sub(r'\*\*(".*?")([，。！？；：,.!;:?])\*\*', r'**\1**\2', line)
-            # 将冒号移到粗体外面（常见于列表项标题）
-            line = re.sub(r'\*\*([^*]+?)([：:])\*\*', r'**\1**\2', line)
+            # 处理粗体内部结尾的标点（不含引号）：**xxx，** -> **xxx**，
+            line = re.sub(r'\*\*([^*"]+?)([，。！？；：,.!;:?])\*\*', r'**\1**\2', line)
+            # 处理粗体内部开头的引号：**"xxx** -> "**xxx**
+            line = re.sub(r'\*\*(")', r'\1**', line)
             
             for part_line in _split_leading_bold(line):
                 processed.append(part_line)
@@ -558,6 +571,8 @@ def extract(docx_path: str, normalize: bool = False) -> Path:
                     md_lines.extend(table_lines[1:])
                 else:
                     md_lines.append(table_lines[0])
+            # 表格后强制插入一个空行，确保后续段落格式正常
+            md_lines.append("")
             continue
 
         # ====== 段落处理 ======
@@ -744,23 +759,25 @@ def extract(docx_path: str, normalize: bool = False) -> Path:
     # 后处理清理
     md_lines = _post_process(md_lines)
     
-    # 修复错误的换行问题：将单独成行的冒号合并到上一行
+    # 修复错误的换行问题：将单独成行的标点符号合并到上一行
     fixed_lines = []
     i = 0
     while i < len(md_lines):
         line = md_lines[i]
-        # 检查下一行是否以冒号开头
-        if i + 1 < len(md_lines) and md_lines[i + 1].strip().startswith(('：', ':')):
-            # 移除当前行末尾的两个空格（软换行标记）
-            if line.endswith('  '):
-                line = line[:-2]
-            # 合并下一行，去掉下一行开头的冒号前的空白
-            next_line = md_lines[i + 1].lstrip()
-            fixed_lines.append(line + next_line)
-            i += 2  # 跳过下一行
-        else:
-            fixed_lines.append(line)
-            i += 1
+        # 检查下一行是否以标点符号开头（句号、冒号、逗号、分号等）
+        if i + 1 < len(md_lines):
+            next_line_stripped = md_lines[i + 1].lstrip()
+            if next_line_stripped and next_line_stripped[0] in '。，；：、！？.,:;!?':
+                # 移除当前行末尾的两个空格（软换行标记）
+                if line.endswith('  '):
+                    line = line[:-2]
+                # 合并下一行，去掉下一行开头的空白
+                fixed_lines.append(line + md_lines[i + 1].lstrip())
+                i += 2  # 跳过下一行
+                continue
+        
+        fixed_lines.append(line)
+        i += 1
     
     # 写入 Markdown 文件
     md_content = "\n".join(fixed_lines) + "\n"
