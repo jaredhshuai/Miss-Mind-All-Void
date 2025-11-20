@@ -1,3 +1,28 @@
+#!/usr/bin/env python3
+"""将 Word 文档转换为 Markdown 格式，并自动修复格式问题
+
+功能特性：
+1. 保留文档顺序（段落、表格、列表、标题）
+2. 导出图片到 Images/<basename>_images/ 并使用相对路径引用
+3. 支持文件名规范化（--normalize 选项）
+4. 处理手动换行符 <w:br/> 和控制字符
+5. 合并相同样式的连续文本块，减少重复的 Markdown 标记
+6. 修复中文粗体引号格式问题（引号移到粗体标记外）
+7. 统一标点符号编码为标准中文标点
+8. 后处理清理：
+   - 替换 NBSP 为普通空格
+   - 分离首行完整粗体句子为独立段落
+   - 合并相邻的粗体段落
+   - 将中文标点符号移到粗体块外
+   - 为非空行添加尾部两空格（软换行）
+9. 幂等性：重复运行产生稳定的 Markdown 输出
+
+使用方法：
+    python docx_to_md.py <docx_path> [--normalize]
+    
+    --normalize: 规范化文件名（移除特殊字符，用连字符替换空格）
+"""
+
 import sys
 import re
 from pathlib import Path
@@ -6,35 +31,133 @@ from docx.text.paragraph import Paragraph
 from docx.table import Table
 from docx.oxml.ns import qn
 
-"""Convert a .docx file to cleaned markdown (one pass).
 
-Features combined (previous convert + clean script):
-1. Preserve document order (paragraphs, tables, lists, headings).
-2. Export images to `Images/<basename>_images/` and reference with relative path.
-3. Normalize filename optionally (`--normalize`).
-4. Explicit handling of manual <w:br/> and control newline chars -> soft break tokens.
-5. Merge contiguous runs with identical bold/italic to reduce repeated markup.
-6. Fix Chinese bold quoting & punctuation merging.
-7. Post-processing cleaning:
-   - Replace NBSP with normal spaces.
-   - Split leading full bold sentence into its own paragraph.
-   - Merge adjacent **bold** segments.
-   - Adjust Chinese punctuation outside bold block.
-   - Add trailing two spaces to non-empty lines for soft line breaks (skip tables, rules, images).
-8. Idempotent: re-running on same DOCX produces stable Markdown.
-"""
+# ============================================================================
+# 工具函数：文件名规范化
+# ============================================================================
 
 def normalize_name(name: str) -> str:
-        # Remove specific punctuation that can cause rendering or path issues
-        name = re.sub(r'[《》：“”"\:]', '', name)
-        # Replace any whitespace sequence with single hyphen
-        name = re.sub(r'\s+', '-', name.strip())
-        # Collapse multiple hyphens
-        name = re.sub(r'-{2,}', '-', name)
-        return name.strip('-')
+    """规范化文件名：移除特殊标点，替换空格为连字符"""
+    # 移除可能导致渲染或路径问题的特殊标点
+    name = re.sub(r'[《》："""\:]', '', name)
+    # 将空白字符序列替换为单个连字符
+    name = re.sub(r'\s+', '-', name.strip())
+    # 合并多个连字符
+    name = re.sub(r'-{2,}', '-', name)
+    return name.strip('-')
+
+
+# ============================================================================
+# 工具函数：标点符号规范化
+# ============================================================================
+
+def normalize_punctuation(text: str) -> str:
+    """统一标点符号编码为标准中文标点
+    
+    采用配对策略处理引号，避免破坏代码块等内容
+    """
+    # 统一双引号：使用配对策略，奇数次用左引号，偶数次用右引号
+    quote_count = 0
+    result = []
+    for char in text:
+        if char in ['\u0022', '\uff02']:  # ASCII " 或全角 ＂
+            if quote_count % 2 == 0:
+                result.append('\u201c')  # 左引号 "
+            else:
+                result.append('\u201d')  # 右引号 "
+            quote_count += 1
+        else:
+            result.append(char)
+    text = ''.join(result)
+    
+    # 统一单引号：只在中文语境中替换
+    single_quote_count = 0
+    result = []
+    for i, char in enumerate(text):
+        if char == '\u0027':  # ASCII单引号 '
+            # 检查前后是否有中文字符
+            prev_is_chinese = i > 0 and '\u4e00' <= text[i-1] <= '\u9fff'
+            next_is_chinese = i < len(text) - 1 and '\u4e00' <= text[i+1] <= '\u9fff'
+            
+            if prev_is_chinese or next_is_chinese:
+                if single_quote_count % 2 == 0:
+                    result.append('\u2018')  # 左单引号 '
+                else:
+                    result.append('\u2019')  # 右单引号 '
+                single_quote_count += 1
+            else:
+                result.append(char)
+        else:
+            result.append(char)
+    text = ''.join(result)
+    
+    # 统一其他标点：仅在中文语境中替换
+    # 感叹号
+    text = re.sub(r'([\u4e00-\u9fff])!', r'\1！', text)
+    text = re.sub(r'!([\u4e00-\u9fff])', r'！\1', text)
+    
+    # 问号
+    text = re.sub(r'([\u4e00-\u9fff])\?', r'\1？', text)
+    text = re.sub(r'\?([\u4e00-\u9fff])', r'？\1', text)
+    
+    # 逗号
+    text = re.sub(r'([\u4e00-\u9fff]),([\u4e00-\u9fff])', r'\1，\2', text)
+    
+    # 分号
+    text = re.sub(r'([\u4e00-\u9fff]);', r'\1；', text)
+    text = re.sub(r';([\u4e00-\u9fff])', r'；\1', text)
+    
+    # 冒号
+    text = re.sub(r'([\u4e00-\u9fff]):', r'\1：', text)
+    text = re.sub(r':([\u4e00-\u9fff])', r'：\1', text)
+    
+    # 括号
+    text = re.sub(r'([\u4e00-\u9fff])\(', r'\1（', text)
+    text = re.sub(r'\(([\u4e00-\u9fff])', r'（\1', text)
+    text = re.sub(r'([\u4e00-\u9fff])\)', r'\1）', text)
+    text = re.sub(r'\)([\u4e00-\u9fff])', r'）\1', text)
+    
+    return text
+
+
+def fix_bold_quotes(text: str) -> str:
+    """修复粗体引号格式：将引号从粗体标记内移到外部
+    
+    转换规则：
+    - **"文本"** -> **"文本"**
+    - "**文本**" -> **"文本"**
+    - "**文本**。" -> **"文本。"**
+    - **"xxx**" -> **"xxx"**
+    """
+    # 第一步：统一所有引号编码为标准中文引号
+    text = normalize_punctuation(text)
+    
+    # 第二步：进行格式转换（现在只需要处理统一后的中文引号）
+    
+    # 规则0：**"xxx"yyy** -> **"xxx"**yyy（处理引号在粗体开头的情况）
+    text = re.sub(r'\*\*"([^"]*?)"([^*]*?)\*\*', r'**"\1"**\2', text)
+    
+    # 规则1："**文本**" -> **"文本"**
+    # 匹配：开引号 + 粗体 + 结束引号
+    text = re.sub(r'"(\*\*([^*]+?)\*\*)"', lambda m: f'**"{m.group(2)}"**', text)
+    
+    # 规则2："**文本**。" -> **"文本。"**
+    # 匹配：开引号 + 粗体 + 标点 + 结束引号
+    text = re.sub(r'"(\*\*([^*]+?)\*\*)([。，、！？；：])"', lambda m: f'**"{m.group(2)}{m.group(3)}"**', text)
+    
+    # 规则3：**"xxx**" -> **"xxx"**
+    # 处理粗体开始正确但结束位置错误的情况
+    text = re.sub(r'\*\*"([^"]+?)\*\*"', r'**"\1"**', text)
+    
+    return text
+
+
+# ============================================================================
+# 文本提取与样式处理
+# ============================================================================
 
 def _extract_run_style(run):
-    """提取单个 run 的文本与样式，不直接返回已包裹的 markdown，方便后续合并。"""
+    """提取单个 run 的文本与样式，不直接返回已包裹的 markdown，方便后续合并"""
     return {
         'text': run.text or '',
         'bold': bool(run.bold),
@@ -43,11 +166,14 @@ def _extract_run_style(run):
         'is_line_break': False,
     }
 
+
 _EXTRA_BREAK_CHARS_PATTERN = re.compile(r'[\r\n\u000b\u000c\u2028\u2029]')
 
+
 def _split_text_with_breaks(text: str) -> list:
-    """将包含额外换行控制符的文本拆分为纯文本和显式换行 token。
-    使用与手动 <w:br/> 相同的 '  \n' 作为换行标记，后续逻辑即可复用。
+    """将包含额外换行控制符的文本拆分为纯文本和显式换行 token
+    
+    使用与手动 <w:br/> 相同的 '  \\n' 作为换行标记，后续逻辑即可复用
     """
     if not text:
         return []
@@ -62,10 +188,11 @@ def _split_text_with_breaks(text: str) -> list:
     tail = text[last:]
     if tail:
         parts.append({'text': tail, 'is_line_break': False})
-    # 若文本以换行结束，最后一个换行已经作为 token 添加，无需额外空 token
     return parts
 
+
 def _format_merged(text: str, bold: bool, italic: bool) -> str:
+    """将文本格式化为 Markdown 样式"""
     if not text:
         return ''
     if bold and italic:
@@ -76,24 +203,35 @@ def _format_merged(text: str, bold: bool, italic: bool) -> str:
         return f"*{text}*"
     return text
 
+
 def _iter_block_items(doc):
-    """Yield paragraphs and tables in document order."""
+    """按文档顺序生成段落和表格"""
     for child in doc.element.body:
         if child.tag.endswith('p'):
             yield Paragraph(child, doc)
         elif child.tag.endswith('tbl'):
             yield Table(child, doc)
 
+
 def _runs_to_tokens(paragraph, part, images_dir: Path, exported: set) -> list:
+    """将段落的 runs 转换为 Markdown tokens"""
     # 采集结构化 run
     raw_runs = []
     for run in getattr(paragraph, 'runs', []):
         data = _extract_run_style(run)
         inline = run.element
+        
         # 处理内部手动换行 <w:br/>
         if inline.xpath('.//w:br'):
-            raw_runs.append({'text': '  \n', 'bold': False, 'italic': False, 'is_image': False, 'is_line_break': True})
-        # 图像
+            raw_runs.append({
+                'text': '  \n',
+                'bold': False,
+                'italic': False,
+                'is_image': False,
+                'is_line_break': True
+            })
+        
+        # 处理图像
         blips = inline.xpath('.//a:blip')
         for blip in blips:
             rId = blip.get('{http://schemas.openxmlformats.org/officeDocument/2006/relationships}embed')
@@ -124,7 +262,14 @@ def _runs_to_tokens(paragraph, part, images_dir: Path, exported: set) -> list:
                     f.write(image_part.blob)
                 exported[rId] = actual_filename
             
-            raw_runs.append({'text': f"![](Images/{images_dir.name}/{actual_filename})", 'bold': False, 'italic': False, 'is_image': True, 'is_line_break': False})
+            raw_runs.append({
+                'text': f"![](Images/{images_dir.name}/{actual_filename})",
+                'bold': False,
+                'italic': False,
+                'is_image': True,
+                'is_line_break': False
+            })
+        
         # 拆分 run.text 中的额外换行控制符
         txt = data['text']
         if txt:
@@ -140,7 +285,7 @@ def _runs_to_tokens(paragraph, part, images_dir: Path, exported: set) -> list:
             else:
                 raw_runs.append(data)
     
-    # Fallback: 如果 runs 为空但段落有文本（可能在域代码或超链接中），直接使用 paragraph.text
+    # Fallback：如果 runs 为空但段落有文本，直接使用 paragraph.text
     if not raw_runs and paragraph.text.strip():
         raw_runs.append({
             'text': paragraph.text,
@@ -150,7 +295,7 @@ def _runs_to_tokens(paragraph, part, images_dir: Path, exported: set) -> list:
             'is_line_break': False,
         })
 
-    # 合并连续样式一致（且非图片/换行） 的 run，减少重复 ** 包裹
+    # 合并连续样式一致（且非图片/换行）的 run，减少重复 ** 包裹
     merged = []
     for item in raw_runs:
         if not merged:
@@ -180,10 +325,18 @@ def _runs_to_tokens(paragraph, part, images_dir: Path, exported: set) -> list:
                 tokens.append(formatted)
     return tokens
 
+
+# ============================================================================
+# 列表处理
+# ============================================================================
+
 def _is_list_paragraph(paragraph) -> bool:
+    """检查段落是否为列表项"""
     return bool(paragraph._p.xpath('.//w:numPr'))
 
+
 def _list_marker(paragraph) -> str:
+    """获取列表标记"""
     numFmt = paragraph._p.xpath('.//w:numPr//w:numFmt')
     if numFmt:
         val = numFmt[0].get(qn('w:val'))
@@ -192,7 +345,9 @@ def _list_marker(paragraph) -> str:
         return '1. '
     return '- '
 
+
 def _get_list_number(paragraph, counters: dict, part) -> int | None:
+    """获取有序列表的实际编号"""
     numPr = paragraph._p.xpath('.//w:numPr')
     if not numPr:
         return None
@@ -211,7 +366,10 @@ def _get_list_number(paragraph, counters: dict, part) -> int | None:
     start_val = 1
     if abstract_e:
         abstract_id = abstract_e[0].get(qn('w:val'))
-        start_e = numbering.xpath(f'.//w:abstractNum[w:abstractNumId[@w:val="{abstract_id}"]]//w:lvl[@w:ilvl="{ilvl}"]//w:start')
+        start_e = numbering.xpath(
+            f'.//w:abstractNum[w:abstractNumId[@w:val="{abstract_id}"]]'
+            f'//w:lvl[@w:ilvl="{ilvl}"]//w:start'
+        )
         if start_e:
             try:
                 start_val = int(start_e[0].get(qn('w:val')))
@@ -223,27 +381,162 @@ def _get_list_number(paragraph, counters: dict, part) -> int | None:
         counters[key] += 1
     return counters[key]
 
+
+# ============================================================================
+# 后处理与清理
+# ============================================================================
+
+def _fix_chinese_bold(line: str) -> str:
+    """修复中文引号粗体合并与标点移出"""
+    if not line or '**' not in line:
+        return line
+    
+    # 合并相邻的 "**xxx**" 格式
+    while True:
+        new_line = re.sub(r'\*\*"\*\*(.*?)\*\*"\*\*', r'**"\1"**', line)
+        if new_line == line:
+            break
+        line = new_line
+    
+    # 合并相邻的粗体块
+    def _merge(match):
+        inner_parts = re.findall(r'\*\*([^*]+?)\*\*', match.group(0))
+        return '**' + ''.join(inner_parts) + '**'
+    line = re.sub(r'(?:\*\*[^*]+?\*\*){2,}', _merge, line)
+    
+    # 将标点符号移到粗体外面
+    line = re.sub(r'\*\*(".*?")([，。！？；：,.!;:?])\*\*', r'**\1**\2', line)
+    
+    return line
+
+
+_adjacent_bold_pattern = re.compile(r'(?:\*\*[^*]+?\*\*){2,}')
+_bold_line_split_pattern = re.compile(r'^(\*\*[^*]+?\*\*)(\S.+)$')
+
+
+def _merge_adjacent_bold(line: str) -> str:
+    """合并相邻的粗体块"""
+    def _merge(match):
+        inner_parts = re.findall(r'\*\*([^*]+?)\*\*', match.group(0))
+        return '**' + ''.join(inner_parts) + '**'
+    return _adjacent_bold_pattern.sub(_merge, line)
+
+
+def _split_leading_bold(line: str) -> list[str]:
+    """分离首行完整粗体句子为独立段落"""
+    # 检查是否应该分割：只有当粗体后还有很长的文本（>50字符）且以句号、叹号等结尾时才分割
+    m = _bold_line_split_pattern.match(line)
+    if not m:
+        return [line]
+    bold_block = m.group(1).rstrip()
+    rest = m.group(2).lstrip()
+    # 如果后续文本太短或不是完整句子，不分割
+    if not rest or len(rest) < 50:
+        return [line]
+    # 检查后续文本是否以完整句子结束
+    if not rest.rstrip()[-1] in '。！？.!?':
+        return [line]
+    return [bold_block, rest]
+
+
+def _post_process(lines: list[str]) -> list[str]:
+    """后处理清理：NBSP 替换、粗体合并、引号修复、软换行添加等"""
+    processed: list[str] = []
+    for line in lines:
+        # 替换 NBSP
+        if '\u00A0' in line:
+            line = line.replace('\u00A0', ' ')
+        
+        # 修复粗体引号格式
+        if '**' in line:
+            line = fix_bold_quotes(line)
+            line = _merge_adjacent_bold(line)
+            
+            # 将标点符号移到粗体外面
+            line = re.sub(r'\*\*(".*?")([，。！？；：,.!;:?])\*\*', r'**\1**\2', line)
+            # 将冒号移到粗体外面（常见于列表项标题）
+            line = re.sub(r'\*\*([^*]+?)([：:])\*\*', r'**\1**\2', line)
+            
+            for part_line in _split_leading_bold(line):
+                processed.append(part_line)
+        else:
+            processed.append(line)
+    
+    # 修复粗体/引号后紧跟破折号等符号的粘连问题，添加空格分隔
+    final_processed = []
+    for line in processed:
+        # 处理各种引号和破折号的组合
+        # U+2014 是长破折号 —, U+2013 是短破折号 –
+        line = re.sub(r'(["\u201C\u201D])(\u2014{1,2}|\u2013)', r'\1 \2', line)
+        line = re.sub(r'(\*\*)(\u2014{1,2}|\u2013)', r'\1 \2', line)
+        final_processed.append(line)
+
+    # 添加软换行（行尾两空格）
+    final: list[str] = []
+    for ln in final_processed:
+        stripped = ln.strip()
+        if not ln:
+            final.append(ln)
+            continue
+        if ln.startswith('|') and ln.endswith('|'):  # 表格行
+            final.append(ln)
+            continue
+        if stripped == '---':  # 水平线
+            final.append(ln)
+            continue
+        if ln.startswith('!['):  # 图片引用
+            final.append(ln)
+            continue
+        if ln.lstrip().startswith('-'):  # 列表项
+            final.append(ln)
+            continue
+        if ln.lstrip().startswith(('#', '>')):  # 标题或引用块
+            final.append(ln)
+            continue
+        # 只在不以标点符号结尾的行添加软换行
+        if not ln.endswith('  '):
+            final.append(ln + '  ')
+        else:
+            final.append(ln)
+    return final
+
+
+# ============================================================================
+# 主转换函数
+# ============================================================================
+
 def extract(docx_path: str, normalize: bool = False) -> Path:
+    """将 Word 文档转换为 Markdown
+    
+    Args:
+        docx_path: Word 文档路径
+        normalize: 是否规范化文件名
+        
+    Returns:
+        生成的 Markdown 文件路径
+    """
     p = Path(docx_path)
     if not p.exists():
-        raise FileNotFoundError(f"File not found: {docx_path}")
+        raise FileNotFoundError(f"文件不存在: {docx_path}")
+    
     doc = Document(str(p))
     original_base = p.stem.strip()
     base_name = normalize_name(original_base) if normalize else original_base
-    # 图片目录改为顶层 Images 下，以 base_name_images 命名
+    
+    # 图片目录：顶层 Images 下，以 base_name_images 命名
     images_root = p.parent / 'Images'
     images_root.mkdir(exist_ok=True)
     images_dir = images_root / f"{base_name}_images"
     images_dir.mkdir(exist_ok=True)
 
     part = doc.part
-    exported = {}  # 改为字典：rId -> 实际文件名
+    exported = {}  # 字典：rId -> 实际文件名
     md_lines = []
     numbering_counters = {}
     last_was_list = False  # 跟踪上一个段落是否为列表
 
     for block in _iter_block_items(doc):
-        # 表格处理
+        # ====== 表格处理 ======
         if isinstance(block, Table):
             table_lines = []
             for r_index, row in enumerate(block.rows):
@@ -256,7 +549,7 @@ def extract(docx_path: str, normalize: bool = False) -> Path:
                 line = '| ' + ' | '.join(cells_content) + ' |'
                 table_lines.append(line)
             if table_lines:
-                # 若有多行，首行视为表头，需要分隔符行（Markdown 语法必要，不属于额外内容）
+                # 若有多行，首行视为表头，需要分隔符行
                 if len(table_lines) > 1:
                     cols = table_lines[0].count('|') - 1
                     separator = '| ' + ' | '.join(['---'] * cols) + ' |'
@@ -267,7 +560,7 @@ def extract(docx_path: str, normalize: bool = False) -> Path:
                     md_lines.append(table_lines[0])
             continue
 
-        # 段落处理
+        # ====== 段落处理 ======
         paragraph = block  # type: Paragraph
         tokens = _runs_to_tokens(paragraph, part, images_dir, exported)
         if not tokens:
@@ -279,7 +572,6 @@ def extract(docx_path: str, normalize: bool = False) -> Path:
         
         # 处理目录样式（toc 1, toc 2, toc 3 等）
         if style_name.lower().startswith('toc '):
-            # 提取目录级别
             try:
                 level_str = style_name.split(' ')[1]
                 level = int(level_str)
@@ -314,9 +606,6 @@ def extract(docx_path: str, normalize: bool = False) -> Path:
                 level = 1
             line = '#' * level + ' ' + ''.join(tokens)
             md_lines.append(line)
-            # 结束任何进行中的有序列表
-            list_sequence = 0
-            in_number_list = False
             continue
 
         # 列表段落检测与真实编号保留
@@ -359,18 +648,14 @@ def extract(docx_path: str, normalize: bool = False) -> Path:
                 segments.append(''.join(current))
             
             # 检测是否应该格式化为列表项
-            # 如果有3个或更多段，且每段长度相似、结构相似（如都以"从"/"你不会"等开头，或都以分号/句号结尾），则视为列表
             should_be_list = False
             if len(segments) >= 3:
-                # 检查是否有共同的开头模式（取前3字）
                 valid_segments = [seg.strip() for seg in segments if seg.strip()]
                 if len(valid_segments) >= 3:
                     starts_3 = [seg[:3] if len(seg) >= 3 else seg for seg in valid_segments]
                     starts_2 = [seg[:2] if len(seg) >= 2 else seg for seg in valid_segments]
-                    # 检查是否有共同的结尾标点
                     ends = [seg.rstrip()[-1] if seg.rstrip() else '' for seg in valid_segments]
                     
-                    # 如果多数段落以相同的2-3字开头，或以相同标点结尾，判定为列表
                     from collections import Counter
                     start_counts_3 = Counter(starts_3)
                     start_counts_2 = Counter(starts_2)
@@ -387,11 +672,10 @@ def extract(docx_path: str, normalize: bool = False) -> Path:
                         should_be_list = True
             
             if should_be_list:
-                # 检查第一个segment是否是引导语或包含引导语前缀
+                # 检查第一个segment是否是引导语
                 first_seg = segments[0].strip() if segments else ''
                 rest_segs = segments[1:] if len(segments) > 1 else []
                 
-                # 检查第一行是否以常见引导词开头（"在这里，"、"在此，"等）
                 intro_prefixes = ['在这里，', '在此，', '在这里:', '在此:']
                 has_intro_prefix = any(first_seg.startswith(prefix) for prefix in intro_prefixes)
                 
@@ -403,7 +687,7 @@ def extract(docx_path: str, normalize: bool = False) -> Path:
                     # 分离引导语
                     for prefix in intro_prefixes:
                         if first_seg.startswith(prefix):
-                            intro_text = prefix.rstrip('，:')  # 去掉逗号或冒号
+                            intro_text = prefix.rstrip('，:')
                             first_list_item = first_seg[len(prefix):].strip()
                             break
                     is_intro = True
@@ -414,8 +698,8 @@ def extract(docx_path: str, normalize: bool = False) -> Path:
                     first_list_item = None
                 
                 if is_intro and intro_text:
-                    md_lines.append(intro_text + '  ')  # 引导语
-                    if first_list_item:  # 如果第一行还有剩余内容，作为第一个列表项
+                    md_lines.append(intro_text + '  ')
+                    if first_list_item:
                         md_lines.append(f"- {first_list_item}")
                     for seg in rest_segs:
                         if seg.strip():
@@ -436,7 +720,7 @@ def extract(docx_path: str, normalize: bool = False) -> Path:
         else:
             md_lines.append(''.join(tokens))
 
-    # 回退：若未捕获图像但存在图像资源，仍需导出并在末尾引用，避免遗漏
+    # 回退：若未捕获图像但存在图像资源，仍需导出并在末尾引用
     if not exported:
         fallback_refs = []
         for rel_id, rel_part in part.related_parts.items():
@@ -450,107 +734,14 @@ def extract(docx_path: str, normalize: bool = False) -> Path:
         for fn in sorted(fallback_refs):
             md_lines.append(f"![](Images/{images_dir.name}/{fn})")
 
-    # 去除开头多余的空行，避免首行即空行导致渲染不一致
+    # 去除开头多余的空行
     while md_lines and not md_lines[0].strip():
         md_lines.pop(0)
 
     # 中文引号粗体合并与标点移出
-    def _fix_chinese_bold(line: str) -> str:
-        if not line or '**' not in line:
-            return line
-        while True:
-            new_line = re.sub(r'\*\*“\*\*(.*?)\*\*”\*\*', r'**“\1”**', line)
-            if new_line == line:
-                break
-            line = new_line
-        def _merge(match):
-            inner_parts = re.findall(r'\*\*([^*]+?)\*\*', match.group(0))
-            return '**' + ''.join(inner_parts) + '**'
-        line = re.sub(r'(?:\*\*[^*]+?\*\*){2,}', _merge, line)
-        line = re.sub(r'\*\*(“.*?”)([，。！？；：,.!;:?])\*\*', r'**\1**\2', line)
-        return line
     md_lines = [_fix_chinese_bold(l) for l in md_lines]
 
-    # --- Post processing & cleaning unified ---
-    _adjacent_bold_pattern = re.compile(r'(?:\*\*[^*]+?\*\*){2,}')
-    _bold_line_split_pattern = re.compile(r'^(\*\*[^*]+?\*\*)(\S.+)$')
-
-    def _merge_adjacent_bold(line: str) -> str:
-        def _merge(match):
-            inner_parts = re.findall(r'\*\*([^*]+?)\*\*', match.group(0))
-            return '**' + ''.join(inner_parts) + '**'
-        return _adjacent_bold_pattern.sub(_merge, line)
-
-    def _split_leading_bold(line: str) -> list[str]:
-        # 检查是否应该分割：只有当粗体后还有很长的文本（>50字符）且以句号、叹号等结尾时才分割
-        m = _bold_line_split_pattern.match(line)
-        if not m:
-            return [line]
-        bold_block = m.group(1).rstrip()
-        rest = m.group(2).lstrip()
-        # 如果后续文本太短或不是完整句子，不分割
-        if not rest or len(rest) < 50:
-            return [line]
-        # 检查后续文本是否以完整句子结束
-        if not rest.rstrip()[-1] in '。！？.!?':
-            return [line]
-        return [bold_block, rest]
-
-    def _post_process(lines: list[str]) -> list[str]:
-        processed: list[str] = []
-        for line in lines:
-            if '\u00A0' in line:
-                line = line.replace('\u00A0', ' ')
-            if '**' in line:
-                line = _merge_adjacent_bold(line)
-                # 修复引号在加粗标记内的问题
-                # 1. 处理完整包围的情况 **"text"** -> "**text**"
-                line = re.sub(r'\*\*"([^"]+?)"\*\*', r'"**\1**"', line)
-                line = re.sub(r'\*\*"([^"]+?)"\*\*', r'"**\1**"', line)
-                # 2. 处理左引号在内的情况 **"text** -> "**text**
-                line = re.sub(r'\*\*"([^"]+?)\*\*', r'"**\1**', line)
-                line = re.sub(r'\*\*"([^"]+?)\*\*', r'"**\1**', line)
-                # 3. 处理右引号在内的情况 **text"** -> **text**"
-                line = re.sub(r'\*\*([^"]+?)"\*\*', r'**\1**"', line)
-                line = re.sub(r'\*\*([^"]+?)"\*\*', r'**\1**"', line)
-                # 将标点符号移到粗体外面
-                line = re.sub(r'\*\*(".*?")([，。！？；：,.!;:?])\*\*', r'**\1**\2', line)
-                # 将冒号移到粗体外面（常见于列表项标题）
-                line = re.sub(r'\*\*([^*]+?)([：:])\*\*', r'**\1**\2', line)
-                for part_line in _split_leading_bold(line):
-                    processed.append(part_line)
-            else:
-                processed.append(line)
-
-        final: list[str] = []
-        for ln in processed:
-            stripped = ln.strip()
-            if not ln:
-                final.append(ln)
-                continue
-            if ln.startswith('|') and ln.endswith('|'):  # table line
-                final.append(ln)
-                continue
-            if stripped == '---':  # horizontal rule
-                final.append(ln)
-                continue
-            if ln.startswith('!['):  # image reference
-                final.append(ln)
-                continue
-            if ln.lstrip().startswith('-'):  # list item
-                final.append(ln)
-                continue
-            if ln.lstrip().startswith(('#', '>')):  # heading or blockquote
-                final.append(ln)
-                continue
-            # 只在不以标点符号结尾的行添加软换行
-            # 这样可以避免在完整句子后强制换行
-            if not ln.endswith('  '):
-                final.append(ln + '  ')
-            else:
-                final.append(ln)
-        return final
-
+    # 后处理清理
     md_lines = _post_process(md_lines)
     
     # 修复错误的换行问题：将单独成行的冒号合并到上一行
@@ -571,19 +762,47 @@ def extract(docx_path: str, normalize: bool = False) -> Path:
             fixed_lines.append(line)
             i += 1
     
+    # 写入 Markdown 文件
     md_content = "\n".join(fixed_lines) + "\n"
     md_path = p.parent / f"{base_name}.md"
     md_path.write_text(md_content, encoding='utf-8')
     return md_path
 
+
+# ============================================================================
+# 主程序入口
+# ============================================================================
+
 def main():
+    """主函数"""
     if len(sys.argv) < 2:
-        print("Usage: python convert_docx_to_md.py <docx_path> [--normalize]")
+        print("使用方法: python docx_to_md.py <docx_path> [--normalize]")
+        print()
+        print("参数说明:")
+        print("  <docx_path>   : Word 文档路径")
+        print("  --normalize   : 规范化文件名（移除特殊字符，用连字符替换空格）")
+        print()
+        print("示例:")
+        print("  python docx_to_md.py document.docx")
+        print("  python docx_to_md.py document.docx --normalize")
         sys.exit(1)
+    
     docx_path = sys.argv[1]
     normalize = '--normalize' in sys.argv[2:]
-    md_path = extract(docx_path, normalize=normalize)
-    print("Markdown created:", md_path)
+    
+    try:
+        md_path = extract(docx_path, normalize=normalize)
+        print(f"✓ 转换成功!")
+        print(f"  Markdown 文件: {md_path}")
+    except FileNotFoundError as e:
+        print(f"✗ 错误: {e}")
+        sys.exit(1)
+    except Exception as e:
+        print(f"✗ 转换失败: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+
 
 if __name__ == "__main__":
     main()
