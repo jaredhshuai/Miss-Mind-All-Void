@@ -1,6 +1,6 @@
 ﻿<div align="center">
 
-# 不识本心，学法无益 | Without Knowing the Original Mind, All Methods Are Useless
+# 不识本心，学法无益 | Miss Mind All Void
 
 </div>
 
