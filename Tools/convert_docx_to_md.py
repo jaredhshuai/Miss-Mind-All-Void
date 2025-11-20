@@ -6,20 +6,22 @@ from docx.text.paragraph import Paragraph
 from docx.table import Table
 from docx.oxml.ns import qn
 
-"""Convert a .docx file to markdown preserving paragraph order and exporting images.
-Images are referenced with original filenames and empty alt text only.
+"""Convert a .docx file to cleaned markdown (one pass).
 
-Optional normalization (--normalize) will sanitize the base name:
-    1. Strip leading/trailing whitespace
-    2. Remove chars: 《 》 ： : “ ” "
-    3. Collapse internal whitespace to single hyphen
-    4. Remove trailing hyphens
-
-Extra newline handling:
-    - Manual <w:br/> breaks become explicit '  \n' tokens
-    - Embedded control chars (\r, \n, \x0b, \x0c, \u2028, \u2029) are split
-      and converted to the same break tokens so paragraphs are properly
-      separated instead of silently merged.
+Features combined (previous convert + clean script):
+1. Preserve document order (paragraphs, tables, lists, headings).
+2. Export images to `Images/<basename>_images/` and reference with relative path.
+3. Normalize filename optionally (`--normalize`).
+4. Explicit handling of manual <w:br/> and control newline chars -> soft break tokens.
+5. Merge contiguous runs with identical bold/italic to reduce repeated markup.
+6. Fix Chinese bold quoting & punctuation merging.
+7. Post-processing cleaning:
+   - Replace NBSP with normal spaces.
+   - Split leading full bold sentence into its own paragraph.
+   - Merge adjacent **bold** segments.
+   - Adjust Chinese punctuation outside bold block.
+   - Add trailing two spaces to non-empty lines for soft line breaks (skip tables, rules, images).
+8. Idempotent: re-running on same DOCX produces stable Markdown.
 """
 
 def normalize_name(name: str) -> str:
@@ -207,6 +209,7 @@ def extract(docx_path: str, normalize: bool = False) -> Path:
     exported = set()
     md_lines = []
     numbering_counters = {}
+    last_was_list = False  # 跟踪上一个段落是否为列表
 
     for block in _iter_block_items(doc):
         # 表格处理
@@ -263,12 +266,25 @@ def extract(docx_path: str, normalize: bool = False) -> Path:
                 val = numFmt[0].get(qn('w:val'))
                 if val == 'bullet':
                     md_lines.append(f"- {''.join(tokens)}")
+                    last_was_list = True
                     continue
                 number = _get_list_number(paragraph, numbering_counters, part)
                 if number is None:
                     number = 1
                 md_lines.append(f"{number}. {''.join(tokens)}")
+                last_was_list = True
                 continue
+            else:
+                # 如果有 numPr 但没有 numFmt，默认为无序列表
+                md_lines.append(f"- {''.join(tokens)}")
+                last_was_list = True
+                continue
+        
+        # 如果上一个是列表，当前不是列表，添加空行分隔
+        if last_was_list:
+            md_lines.append("")
+            last_was_list = False
+        
         # 非列表：处理段落内手动换行拆段
         if '  \n' in tokens:
             segments = []
@@ -281,10 +297,82 @@ def extract(docx_path: str, normalize: bool = False) -> Path:
                     current.append(tk)
             if current:
                 segments.append(''.join(current))
-            for idx, seg in enumerate(segments):
-                md_lines.append(seg)
-                if idx != len(segments) - 1:
-                    md_lines.append('')  # 空行分隔成新段落
+            
+            # 检测是否应该格式化为列表项
+            # 如果有3个或更多段，且每段长度相似、结构相似（如都以"从"/"你不会"等开头，或都以分号/句号结尾），则视为列表
+            should_be_list = False
+            if len(segments) >= 3:
+                # 检查是否有共同的开头模式（取前3字）
+                valid_segments = [seg.strip() for seg in segments if seg.strip()]
+                if len(valid_segments) >= 3:
+                    starts_3 = [seg[:3] if len(seg) >= 3 else seg for seg in valid_segments]
+                    starts_2 = [seg[:2] if len(seg) >= 2 else seg for seg in valid_segments]
+                    # 检查是否有共同的结尾标点
+                    ends = [seg.rstrip()[-1] if seg.rstrip() else '' for seg in valid_segments]
+                    
+                    # 如果多数段落以相同的2-3字开头，或以相同标点结尾，判定为列表
+                    from collections import Counter
+                    start_counts_3 = Counter(starts_3)
+                    start_counts_2 = Counter(starts_2)
+                    end_counts = Counter(ends)
+                    
+                    most_common_start_3 = start_counts_3.most_common(1)[0] if start_counts_3 else ('', 0)
+                    most_common_start_2 = start_counts_2.most_common(1)[0] if start_counts_2 else ('', 0)
+                    most_common_end = end_counts.most_common(1)[0] if end_counts else ('', 0)
+                    
+                    # 超过一半段落有相同开头或结尾模式
+                    if (most_common_start_3[1] >= len(valid_segments) / 2 or 
+                        most_common_start_2[1] >= len(valid_segments) / 2 or 
+                        most_common_end[1] >= len(valid_segments) / 2):
+                        should_be_list = True
+            
+            if should_be_list:
+                # 检查第一个segment是否是引导语或包含引导语前缀
+                first_seg = segments[0].strip() if segments else ''
+                rest_segs = segments[1:] if len(segments) > 1 else []
+                
+                # 检查第一行是否以常见引导词开头（"在这里，"、"在此，"等）
+                intro_prefixes = ['在这里，', '在此，', '在这里:', '在此:']
+                has_intro_prefix = any(first_seg.startswith(prefix) for prefix in intro_prefixes)
+                
+                is_intro = False
+                intro_text = ''
+                first_list_item = first_seg
+                
+                if has_intro_prefix and len(rest_segs) >= 2:
+                    # 分离引导语
+                    for prefix in intro_prefixes:
+                        if first_seg.startswith(prefix):
+                            intro_text = prefix.rstrip('，:')  # 去掉逗号或冒号
+                            first_list_item = first_seg[len(prefix):].strip()
+                            break
+                    is_intro = True
+                elif first_seg and len(rest_segs) >= 2 and len(first_seg) < 20:
+                    # 第一个segment很短，视为引导语
+                    is_intro = True
+                    intro_text = first_seg
+                    first_list_item = None
+                
+                if is_intro and intro_text:
+                    md_lines.append(intro_text + '  ')  # 引导语
+                    if first_list_item:  # 如果第一行还有剩余内容，作为第一个列表项
+                        md_lines.append(f"- {first_list_item}")
+                    for seg in rest_segs:
+                        if seg.strip():
+                            md_lines.append(f"- {seg}")
+                    last_was_list = True
+                else:
+                    # 全部格式化为列表
+                    for seg in segments:
+                        if seg.strip():
+                            md_lines.append(f"- {seg}")
+                    last_was_list = True
+            else:
+                # 保持原样：分段处理
+                for idx, seg in enumerate(segments):
+                    md_lines.append(seg)
+                    if idx != len(segments) - 1:
+                        md_lines.append('')  # 空行分隔成新段落
         else:
             md_lines.append(''.join(tokens))
 
@@ -323,39 +411,57 @@ def extract(docx_path: str, normalize: bool = False) -> Path:
         return line
     md_lines = [_fix_chinese_bold(l) for l in md_lines]
 
-    # --- Post processing for markdown rendering compatibility ---
+    # --- Post processing & cleaning unified ---
+    _adjacent_bold_pattern = re.compile(r'(?:\*\*[^*]+?\*\*){2,}')
+    _bold_line_split_pattern = re.compile(r'^(\*\*[^*]+?\*\*)(\S.+)$')
+
+    def _merge_adjacent_bold(line: str) -> str:
+        def _merge(match):
+            inner_parts = re.findall(r'\*\*([^*]+?)\*\*', match.group(0))
+            return '**' + ''.join(inner_parts) + '**'
+        return _adjacent_bold_pattern.sub(_merge, line)
+
+    def _split_leading_bold(line: str) -> list[str]:
+        m = _bold_line_split_pattern.match(line)
+        if not m:
+            return [line]
+        bold_block = m.group(1).rstrip()
+        rest = m.group(2).lstrip()
+        return [bold_block, rest] if rest else [line]
+
     def _post_process(lines: list[str]) -> list[str]:
-        processed = []
+        processed: list[str] = []
         for line in lines:
-            # Replace non-breaking spaces with normal spaces
             if '\u00A0' in line:
                 line = line.replace('\u00A0', ' ')
-
-            # Split a leading full bold sentence from following text into its own paragraph
-            # Pattern: **....**<non-space or space then other text>
-            m = re.match(r'^\*\*[^*]+?\*\*')
-            if m and m.end() < len(line.strip()):
-                # Ensure we are not splitting headings or list markers (line already starts with ** so fine)
-                bold_part = line[:m.end()].rstrip()
-                rest = line[m.end():].lstrip()
-                processed.append(bold_part)
-                if rest:
-                    processed.append(rest)
-                continue
-
-            processed.append(line)
-        # Add trailing two spaces to every non-empty line (soft line breaks inside paragraphs)
-        normalized = []
-        for ln in processed:
-            if ln and not ln.endswith('  '):
-                # Avoid adding spaces to table separator lines like | --- |
-                if ln.startswith('|') and ln.endswith('|'):
-                    normalized.append(ln)
-                else:
-                    normalized.append(ln + '  ')
+            if '**' in line:
+                line = _merge_adjacent_bold(line)
+                line = re.sub(r'\*\*(“.*?”)([，。！？；：,.!;:?])\*\*', r'**\1**\2', line)
+                for part_line in _split_leading_bold(line):
+                    processed.append(part_line)
             else:
-                normalized.append(ln)
-        return normalized
+                processed.append(line)
+
+        final: list[str] = []
+        for ln in processed:
+            stripped = ln.strip()
+            if not ln:
+                final.append(ln)
+                continue
+            if ln.startswith('|') and ln.endswith('|'):  # table line
+                final.append(ln)
+                continue
+            if stripped == '---':  # horizontal rule
+                final.append(ln)
+                continue
+            if ln.startswith('!['):  # image reference
+                final.append(ln)
+                continue
+            if not ln.endswith('  '):
+                final.append(ln + '  ')
+            else:
+                final.append(ln)
+        return final
 
     md_lines = _post_process(md_lines)
     md_content = "\n".join(md_lines) + "\n"
