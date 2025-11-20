@@ -209,6 +209,7 @@ def extract(docx_path: str, normalize: bool = False) -> Path:
     exported = set()
     md_lines = []
     numbering_counters = {}
+    last_was_list = False  # 跟踪上一个段落是否为列表
 
     for block in _iter_block_items(doc):
         # 表格处理
@@ -265,12 +266,25 @@ def extract(docx_path: str, normalize: bool = False) -> Path:
                 val = numFmt[0].get(qn('w:val'))
                 if val == 'bullet':
                     md_lines.append(f"- {''.join(tokens)}")
+                    last_was_list = True
                     continue
                 number = _get_list_number(paragraph, numbering_counters, part)
                 if number is None:
                     number = 1
                 md_lines.append(f"{number}. {''.join(tokens)}")
+                last_was_list = True
                 continue
+            else:
+                # 如果有 numPr 但没有 numFmt，默认为无序列表
+                md_lines.append(f"- {''.join(tokens)}")
+                last_was_list = True
+                continue
+        
+        # 如果上一个是列表，当前不是列表，添加空行分隔
+        if last_was_list:
+            md_lines.append("")
+            last_was_list = False
+        
         # 非列表：处理段落内手动换行拆段
         if '  \n' in tokens:
             segments = []
@@ -283,10 +297,82 @@ def extract(docx_path: str, normalize: bool = False) -> Path:
                     current.append(tk)
             if current:
                 segments.append(''.join(current))
-            for idx, seg in enumerate(segments):
-                md_lines.append(seg)
-                if idx != len(segments) - 1:
-                    md_lines.append('')  # 空行分隔成新段落
+            
+            # 检测是否应该格式化为列表项
+            # 如果有3个或更多段，且每段长度相似、结构相似（如都以"从"/"你不会"等开头，或都以分号/句号结尾），则视为列表
+            should_be_list = False
+            if len(segments) >= 3:
+                # 检查是否有共同的开头模式（取前3字）
+                valid_segments = [seg.strip() for seg in segments if seg.strip()]
+                if len(valid_segments) >= 3:
+                    starts_3 = [seg[:3] if len(seg) >= 3 else seg for seg in valid_segments]
+                    starts_2 = [seg[:2] if len(seg) >= 2 else seg for seg in valid_segments]
+                    # 检查是否有共同的结尾标点
+                    ends = [seg.rstrip()[-1] if seg.rstrip() else '' for seg in valid_segments]
+                    
+                    # 如果多数段落以相同的2-3字开头，或以相同标点结尾，判定为列表
+                    from collections import Counter
+                    start_counts_3 = Counter(starts_3)
+                    start_counts_2 = Counter(starts_2)
+                    end_counts = Counter(ends)
+                    
+                    most_common_start_3 = start_counts_3.most_common(1)[0] if start_counts_3 else ('', 0)
+                    most_common_start_2 = start_counts_2.most_common(1)[0] if start_counts_2 else ('', 0)
+                    most_common_end = end_counts.most_common(1)[0] if end_counts else ('', 0)
+                    
+                    # 超过一半段落有相同开头或结尾模式
+                    if (most_common_start_3[1] >= len(valid_segments) / 2 or 
+                        most_common_start_2[1] >= len(valid_segments) / 2 or 
+                        most_common_end[1] >= len(valid_segments) / 2):
+                        should_be_list = True
+            
+            if should_be_list:
+                # 检查第一个segment是否是引导语或包含引导语前缀
+                first_seg = segments[0].strip() if segments else ''
+                rest_segs = segments[1:] if len(segments) > 1 else []
+                
+                # 检查第一行是否以常见引导词开头（"在这里，"、"在此，"等）
+                intro_prefixes = ['在这里，', '在此，', '在这里:', '在此:']
+                has_intro_prefix = any(first_seg.startswith(prefix) for prefix in intro_prefixes)
+                
+                is_intro = False
+                intro_text = ''
+                first_list_item = first_seg
+                
+                if has_intro_prefix and len(rest_segs) >= 2:
+                    # 分离引导语
+                    for prefix in intro_prefixes:
+                        if first_seg.startswith(prefix):
+                            intro_text = prefix.rstrip('，:')  # 去掉逗号或冒号
+                            first_list_item = first_seg[len(prefix):].strip()
+                            break
+                    is_intro = True
+                elif first_seg and len(rest_segs) >= 2 and len(first_seg) < 20:
+                    # 第一个segment很短，视为引导语
+                    is_intro = True
+                    intro_text = first_seg
+                    first_list_item = None
+                
+                if is_intro and intro_text:
+                    md_lines.append(intro_text + '  ')  # 引导语
+                    if first_list_item:  # 如果第一行还有剩余内容，作为第一个列表项
+                        md_lines.append(f"- {first_list_item}")
+                    for seg in rest_segs:
+                        if seg.strip():
+                            md_lines.append(f"- {seg}")
+                    last_was_list = True
+                else:
+                    # 全部格式化为列表
+                    for seg in segments:
+                        if seg.strip():
+                            md_lines.append(f"- {seg}")
+                    last_was_list = True
+            else:
+                # 保持原样：分段处理
+                for idx, seg in enumerate(segments):
+                    md_lines.append(seg)
+                    if idx != len(segments) - 1:
+                        md_lines.append('')  # 空行分隔成新段落
         else:
             md_lines.append(''.join(tokens))
 
