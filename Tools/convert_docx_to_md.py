@@ -102,13 +102,29 @@ def _runs_to_tokens(paragraph, part, images_dir: Path, exported: set) -> list:
             image_part = part.related_parts.get(rId)
             if image_part is None:
                 continue
-            filename = Path(image_part.filename).name
-            out_path = images_dir / filename
-            if filename not in exported:
+            
+            # 使用 rId 作为唯一标识，避免重名文件覆盖
+            base_filename = Path(image_part.filename).name
+            if rId in exported:
+                # 已经导出过这个 rId，直接使用之前的文件名
+                actual_filename = exported[rId]
+            else:
+                # 检查文件名是否重复，如果重复则添加序号
+                actual_filename = base_filename
+                counter = 1
+                while (images_dir / actual_filename).exists():
+                    stem = Path(base_filename).stem
+                    suffix = Path(base_filename).suffix
+                    actual_filename = f"{stem}_{counter}{suffix}"
+                    counter += 1
+                
+                # 导出图片
+                out_path = images_dir / actual_filename
                 with open(out_path, 'wb') as f:
                     f.write(image_part.blob)
-                exported.add(filename)
-            raw_runs.append({'text': f"![](Images/{images_dir.name}/{filename})", 'bold': False, 'italic': False, 'is_image': True, 'is_line_break': False})
+                exported[rId] = actual_filename
+            
+            raw_runs.append({'text': f"![](Images/{images_dir.name}/{actual_filename})", 'bold': False, 'italic': False, 'is_image': True, 'is_line_break': False})
         # 拆分 run.text 中的额外换行控制符
         txt = data['text']
         if txt:
@@ -150,8 +166,13 @@ def _runs_to_tokens(paragraph, part, images_dir: Path, exported: set) -> list:
 
     # 输出为最终 markdown token 列表
     tokens = []
-    for m in merged:
-        if m['is_image'] or m['is_line_break']:
+    for i, m in enumerate(merged):
+        if m['is_image']:
+            tokens.append(m['text'])
+            # 如果图片后还有内容（不是最后一项），添加换行
+            if i < len(merged) - 1:
+                tokens.append('\n\n')
+        elif m['is_line_break']:
             tokens.append(m['text'])
         else:
             formatted = _format_merged(m['text'], m['bold'], m['italic'])
@@ -216,7 +237,7 @@ def extract(docx_path: str, normalize: bool = False) -> Path:
     images_dir.mkdir(exist_ok=True)
 
     part = doc.part
-    exported = set()
+    exported = {}  # 改为字典：rId -> 实际文件名
     md_lines = []
     numbering_counters = {}
     last_was_list = False  # 跟踪上一个段落是否为列表
@@ -482,7 +503,20 @@ def extract(docx_path: str, normalize: bool = False) -> Path:
                 line = line.replace('\u00A0', ' ')
             if '**' in line:
                 line = _merge_adjacent_bold(line)
-                line = re.sub(r'\*\*(“.*?”)([，。！？；：,.!;:?])\*\*', r'**\1**\2', line)
+                # 修复引号在加粗标记内的问题
+                # 1. 处理完整包围的情况 **"text"** -> "**text**"
+                line = re.sub(r'\*\*"([^"]+?)"\*\*', r'"**\1**"', line)
+                line = re.sub(r'\*\*"([^"]+?)"\*\*', r'"**\1**"', line)
+                # 2. 处理左引号在内的情况 **"text** -> "**text**
+                line = re.sub(r'\*\*"([^"]+?)\*\*', r'"**\1**', line)
+                line = re.sub(r'\*\*"([^"]+?)\*\*', r'"**\1**', line)
+                # 3. 处理右引号在内的情况 **text"** -> **text**"
+                line = re.sub(r'\*\*([^"]+?)"\*\*', r'**\1**"', line)
+                line = re.sub(r'\*\*([^"]+?)"\*\*', r'**\1**"', line)
+                # 将标点符号移到粗体外面
+                line = re.sub(r'\*\*(".*?")([，。！？；：,.!;:?])\*\*', r'**\1**\2', line)
+                # 将冒号移到粗体外面（常见于列表项标题）
+                line = re.sub(r'\*\*([^*]+?)([：:])\*\*', r'**\1**\2', line)
                 for part_line in _split_leading_bold(line):
                     processed.append(part_line)
             else:
@@ -518,7 +552,26 @@ def extract(docx_path: str, normalize: bool = False) -> Path:
         return final
 
     md_lines = _post_process(md_lines)
-    md_content = "\n".join(md_lines) + "\n"
+    
+    # 修复错误的换行问题：将单独成行的冒号合并到上一行
+    fixed_lines = []
+    i = 0
+    while i < len(md_lines):
+        line = md_lines[i]
+        # 检查下一行是否以冒号开头
+        if i + 1 < len(md_lines) and md_lines[i + 1].strip().startswith(('：', ':')):
+            # 移除当前行末尾的两个空格（软换行标记）
+            if line.endswith('  '):
+                line = line[:-2]
+            # 合并下一行，去掉下一行开头的冒号前的空白
+            next_line = md_lines[i + 1].lstrip()
+            fixed_lines.append(line + next_line)
+            i += 2  # 跳过下一行
+        else:
+            fixed_lines.append(line)
+            i += 1
+    
+    md_content = "\n".join(fixed_lines) + "\n"
     md_path = p.parent / f"{base_name}.md"
     md_path.write_text(md_content, encoding='utf-8')
     return md_path
