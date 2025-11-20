@@ -571,6 +571,8 @@ def extract(docx_path: str, normalize: bool = False) -> Path:
                     md_lines.extend(table_lines[1:])
                 else:
                     md_lines.append(table_lines[0])
+            # 表格后强制插入一个空行，确保后续段落格式正常
+            md_lines.append("")
             continue
 
         # ====== 段落处理 ======
