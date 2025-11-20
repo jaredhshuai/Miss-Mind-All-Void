@@ -461,12 +461,19 @@ def extract(docx_path: str, normalize: bool = False) -> Path:
         return _adjacent_bold_pattern.sub(_merge, line)
 
     def _split_leading_bold(line: str) -> list[str]:
+        # 检查是否应该分割：只有当粗体后还有很长的文本（>50字符）且以句号、叹号等结尾时才分割
         m = _bold_line_split_pattern.match(line)
         if not m:
             return [line]
         bold_block = m.group(1).rstrip()
         rest = m.group(2).lstrip()
-        return [bold_block, rest] if rest else [line]
+        # 如果后续文本太短或不是完整句子，不分割
+        if not rest or len(rest) < 50:
+            return [line]
+        # 检查后续文本是否以完整句子结束
+        if not rest.rstrip()[-1] in '。！？.!?':
+            return [line]
+        return [bold_block, rest]
 
     def _post_process(lines: list[str]) -> list[str]:
         processed: list[str] = []
@@ -496,6 +503,14 @@ def extract(docx_path: str, normalize: bool = False) -> Path:
             if ln.startswith('!['):  # image reference
                 final.append(ln)
                 continue
+            if ln.lstrip().startswith('-'):  # list item
+                final.append(ln)
+                continue
+            if ln.lstrip().startswith(('#', '>')):  # heading or blockquote
+                final.append(ln)
+                continue
+            # 只在不以标点符号结尾的行添加软换行
+            # 这样可以避免在完整句子后强制换行
             if not ln.endswith('  '):
                 final.append(ln + '  ')
             else:
