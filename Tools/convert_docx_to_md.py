@@ -6,20 +6,22 @@ from docx.text.paragraph import Paragraph
 from docx.table import Table
 from docx.oxml.ns import qn
 
-"""Convert a .docx file to markdown preserving paragraph order and exporting images.
-Images are referenced with original filenames and empty alt text only.
+"""Convert a .docx file to cleaned markdown (one pass).
 
-Optional normalization (--normalize) will sanitize the base name:
-    1. Strip leading/trailing whitespace
-    2. Remove chars: 《 》 ： : “ ” "
-    3. Collapse internal whitespace to single hyphen
-    4. Remove trailing hyphens
-
-Extra newline handling:
-    - Manual <w:br/> breaks become explicit '  \n' tokens
-    - Embedded control chars (\r, \n, \x0b, \x0c, \u2028, \u2029) are split
-      and converted to the same break tokens so paragraphs are properly
-      separated instead of silently merged.
+Features combined (previous convert + clean script):
+1. Preserve document order (paragraphs, tables, lists, headings).
+2. Export images to `Images/<basename>_images/` and reference with relative path.
+3. Normalize filename optionally (`--normalize`).
+4. Explicit handling of manual <w:br/> and control newline chars -> soft break tokens.
+5. Merge contiguous runs with identical bold/italic to reduce repeated markup.
+6. Fix Chinese bold quoting & punctuation merging.
+7. Post-processing cleaning:
+   - Replace NBSP with normal spaces.
+   - Split leading full bold sentence into its own paragraph.
+   - Merge adjacent **bold** segments.
+   - Adjust Chinese punctuation outside bold block.
+   - Add trailing two spaces to non-empty lines for soft line breaks (skip tables, rules, images).
+8. Idempotent: re-running on same DOCX produces stable Markdown.
 """
 
 def normalize_name(name: str) -> str:
@@ -323,39 +325,57 @@ def extract(docx_path: str, normalize: bool = False) -> Path:
         return line
     md_lines = [_fix_chinese_bold(l) for l in md_lines]
 
-    # --- Post processing for markdown rendering compatibility ---
+    # --- Post processing & cleaning unified ---
+    _adjacent_bold_pattern = re.compile(r'(?:\*\*[^*]+?\*\*){2,}')
+    _bold_line_split_pattern = re.compile(r'^(\*\*[^*]+?\*\*)(\S.+)$')
+
+    def _merge_adjacent_bold(line: str) -> str:
+        def _merge(match):
+            inner_parts = re.findall(r'\*\*([^*]+?)\*\*', match.group(0))
+            return '**' + ''.join(inner_parts) + '**'
+        return _adjacent_bold_pattern.sub(_merge, line)
+
+    def _split_leading_bold(line: str) -> list[str]:
+        m = _bold_line_split_pattern.match(line)
+        if not m:
+            return [line]
+        bold_block = m.group(1).rstrip()
+        rest = m.group(2).lstrip()
+        return [bold_block, rest] if rest else [line]
+
     def _post_process(lines: list[str]) -> list[str]:
-        processed = []
+        processed: list[str] = []
         for line in lines:
-            # Replace non-breaking spaces with normal spaces
             if '\u00A0' in line:
                 line = line.replace('\u00A0', ' ')
-
-            # Split a leading full bold sentence from following text into its own paragraph
-            # Pattern: **....**<non-space or space then other text>
-            m = re.match(r'^\*\*[^*]+?\*\*')
-            if m and m.end() < len(line.strip()):
-                # Ensure we are not splitting headings or list markers (line already starts with ** so fine)
-                bold_part = line[:m.end()].rstrip()
-                rest = line[m.end():].lstrip()
-                processed.append(bold_part)
-                if rest:
-                    processed.append(rest)
-                continue
-
-            processed.append(line)
-        # Add trailing two spaces to every non-empty line (soft line breaks inside paragraphs)
-        normalized = []
-        for ln in processed:
-            if ln and not ln.endswith('  '):
-                # Avoid adding spaces to table separator lines like | --- |
-                if ln.startswith('|') and ln.endswith('|'):
-                    normalized.append(ln)
-                else:
-                    normalized.append(ln + '  ')
+            if '**' in line:
+                line = _merge_adjacent_bold(line)
+                line = re.sub(r'\*\*(“.*?”)([，。！？；：,.!;:?])\*\*', r'**\1**\2', line)
+                for part_line in _split_leading_bold(line):
+                    processed.append(part_line)
             else:
-                normalized.append(ln)
-        return normalized
+                processed.append(line)
+
+        final: list[str] = []
+        for ln in processed:
+            stripped = ln.strip()
+            if not ln:
+                final.append(ln)
+                continue
+            if ln.startswith('|') and ln.endswith('|'):  # table line
+                final.append(ln)
+                continue
+            if stripped == '---':  # horizontal rule
+                final.append(ln)
+                continue
+            if ln.startswith('!['):  # image reference
+                final.append(ln)
+                continue
+            if not ln.endswith('  '):
+                final.append(ln + '  ')
+            else:
+                final.append(ln)
+        return final
 
     md_lines = _post_process(md_lines)
     md_content = "\n".join(md_lines) + "\n"
